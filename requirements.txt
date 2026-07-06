@@ -1,0 +1,18 @@
+python-dotenv 
+chromadb
+crewai 
+crewai-tools 
+nest_asyncio
+numpy
+openai
+pypdf
+streamlit # added
+tiktoken
+langchain
+langchain-core # added
+langchain_chroma # added - resolved path issues with [websocket-client][pygments] [onnxruntime][aiohappyeyeballs][build][huggingface-hub][aiohttp][chromadb]
+langchain-openai
+langchain-experimental
+langchain-community  # added
+langchain-text-splitters
+lolviz
