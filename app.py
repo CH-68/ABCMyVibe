@@ -5,13 +5,17 @@ from pypdf import PdfReader
 from src.crew import setup_and_run_crew
 
 st.set_page_config(page_title="Compliance Verifier", page_icon="🛡️")
-st.title("Controlled Compliance Verifier")
+st.title("Agentic Compliance Verifier")
 st.caption(
-    "CrewAI-based verification for repeatable, auditable policy checks with human-review routing for ambiguous cases."
+    "CrewAI-based verification for repeatable, auditable policy checks for human-in-the-loop."
 )
 
 if "report" not in st.session_state:
     st.session_state.report = None
+
+# Do not continue if check_password is not True.
+if not check_password():
+        st.stop()
 
 
 def extract_pdf_text(uploaded_file) -> str:
@@ -33,7 +37,7 @@ with st.sidebar:
 
     st.markdown("---")
     if st.button("Run verification", disabled=not (policy_file and target_file)):
-        with st.spinner("Running controlled verification..."):
+        with st.spinner("Running verification..."):
             policy_text = extract_pdf_text(policy_file)
             target_text = extract_pdf_text(target_file)
             if not policy_text or not target_text:

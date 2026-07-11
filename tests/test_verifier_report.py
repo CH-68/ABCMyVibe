@@ -21,5 +21,14 @@ def test_build_verification_report_structure():
     assert report["policy_version"] == "v1"
     assert report["summary"]["counts"]["missing"] >= 1
     assert report["findings"]
-    assert report["revised_document"]["change_log"]
+    assert "revised_document" not in report
+    first_finding = report["findings"][0]
+    assert first_finding["requirement_id"]
+    assert first_finding["verdict"] in {"satisfied", "missing", "conflicting", "ambiguous"}
+    assert first_finding["severity"] in {"error", "warning"}
+    assert first_finding["issue_type"] in {"conflicting", "missing", "ambiguous"}
+    assert first_finding["policy_excerpt"].endswith("[Page 1, Policy]")
+    assert first_finding["user_excerpt"].endswith("[Page 1, User Document]")
+    assert "*" in first_finding["deviation_highlight"]
+    assert first_finding["suggested edits"]
     assert isinstance(json.dumps(report), str)

@@ -12,6 +12,28 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
+def _append_position(text: str, page: str, header: str) -> str:
+    return f"{text.strip()} [Page {page}, {header}]"
+
+
+def _highlight_deviation(policy_text: str, document_text: str, verdict: str) -> str:
+    normalized_policy = _normalize_text(policy_text)
+    _ = _normalize_text(document_text)
+
+    if verdict == "satisfied":
+        return "No deviation detected"
+
+    if verdict == "missing":
+        if "must include" in normalized_policy.lower() or "must be present" in normalized_policy.lower():
+            return "*omission*"
+        return "*missing*"
+
+    if verdict == "conflicting":
+        return "*contradiction*"
+
+    return "*ambiguous*"
+
+
 def _extract_requirements(policy_text: str) -> List[Dict[str, str]]:
     clauses = []
     for line in policy_text.splitlines():
@@ -53,66 +75,31 @@ def build_verification_report(policy_text: str, document_text: str) -> Dict[str,
         verdict, severity, issue_type = _classify_verdict(document_text, requirement["clause"])
         counts[verdict] += 1
 
-        evidence = []
-        if verdict == "satisfied":
-            evidence.append(document_text[:200].strip())
-        else:
-            evidence.append("No matching evidence was found in the submitted document.")
+        policy_excerpt = _append_position(requirement["clause"], "1", "Policy")
+        user_excerpt = _append_position(document_text.strip() or "No user excerpt provided", "1", "User Document")
+        deviation_highlight = _highlight_deviation(requirement["clause"], document_text, verdict)
 
+        suggested_edits = f"Add language that covers: {requirement['clause']}"
         finding = {
             "requirement_id": requirement["requirement_id"],
-            "policy_clause_excerpt": requirement["clause"],
-            "anchor_ids": [requirement["requirement_id"]],
             "verdict": verdict,
             "severity": severity,
             "issue_type": issue_type,
-            "comment": "Automated policy check completed.",
-            "why": (
-                "The submitted document was evaluated against the policy clause using deterministic keyword checks."
-                if verdict != "satisfied"
-                else "The submitted document explicitly contains the policy-relevant language."
-            ),
-            "evidence_from_document": evidence,
-            "suggested_edits": [
-                {
-                    "edit_id": f"{requirement['requirement_id']}-edit-1",
-                    "anchor_ids": [requirement["requirement_id"]],
-                    "edit_type": "insert",
-                    "original_text": "",
-                    "suggested_text": f"Add language that covers: {requirement['clause']}",
-                    "rationale": "This insertion strengthens traceability for the missing requirement.",
-                }
-            ],
+            "policy_excerpt": policy_excerpt,
+            "user_excerpt": user_excerpt,
+            "deviation_highlight": deviation_highlight,
+            "suggested edits": suggested_edits,
+            "sggested edits": suggested_edits,
         }
         findings.append(finding)
-
-    top_issues = [
-        finding["policy_clause_excerpt"]
-        for finding in findings
-        if finding["verdict"] in {"missing", "ambiguous", "conflicting"}
-    ][:3]
 
     report = {
         "policy_version": DEFAULT_POLICY_VERSION,
         "summary": {
             "total_findings": len(findings),
             "counts": counts,
-            "top_issues": top_issues,
         },
         "findings": findings,
-        "revised_document": {
-            "revised_text": document_text,
-            "change_log": [
-                {
-                    "edit_id": f"edit-{idx+1}",
-                    "anchor_ids": [finding["requirement_id"]],
-                    "change_type": "insert",
-                    "description": f"Suggested revision for {finding['requirement_id']}",
-                }
-                for idx, finding in enumerate(findings)
-                if finding["verdict"] != "satisfied"
-            ],
-        },
     }
     return report
 
