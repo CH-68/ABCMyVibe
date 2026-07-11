@@ -1,355 +1,76 @@
-import os
-import tempfile
-import traceback
-from typing import Any, Sequence
-
+﻿import io
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import Chroma
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from openai import OpenAI
-import hashlib
+from pypdf import PdfReader
 
-# ----------------------------
-# LLM setup
-# ----------------------------
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+from src.crew import setup_and_run_crew
 
+st.set_page_config(page_title="Compliance Verifier", page_icon="🛡️")
+st.title("Controlled Compliance Verifier")
+st.caption(
+    "CrewAI-based verification for repeatable, auditable policy checks with human-review routing for ambiguous cases."
+)
 
-def normalize_uploaded_files(uploaded_files: Any) -> list[Any]:
-    """Accept either a single uploaded file or a list of uploaded files."""
-    if uploaded_files is None:
-        return []
-    if isinstance(uploaded_files, (list, tuple)):
-        return list(uploaded_files)
-    return [uploaded_files]
+if "report" not in st.session_state:
+    st.session_state.report = None
 
 
-# ----------------------------
-# RAG: Load + Split PDF
-# ----------------------------
-def load_and_split(uploaded_files: Sequence[Any]) -> list[Document]:
-    """Load one or more uploaded PDFs, split them into chunks, and return LangChain Document chunks."""
-    files = normalize_uploaded_files(uploaded_files)
-    if not files:
-        raise ValueError("No files were uploaded.")
+def extract_pdf_text(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
 
-    all_chunks: list[Document] = []
-
-    for uploaded_file in files:
-        data = uploaded_file.read()
-        if not data:
-            continue
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(data)
-            temp_file_path = tmp.name
-
-        try:
-            loader = PyPDFLoader(temp_file_path)
-            pages = loader.load()
-
-            if not pages:
-                continue
-
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=800,
-                chunk_overlap=100,
-                separators=["\n\n", "\n", " ", ""],
-            )
-            chunks = text_splitter.split_documents(pages)
-
-            for chunk in chunks:
-                metadata = dict(getattr(chunk, "metadata", {}) or {})
-                metadata["source"] = getattr(uploaded_file, "name", "uploaded.pdf")
-                chunk.metadata = metadata
-
-            all_chunks.extend(chunks)
-        finally:
-            os.remove(temp_file_path)
-
-    if not all_chunks:
-        raise ValueError("No readable text could be extracted from the uploaded PDFs.")
-
-    return all_chunks
+    reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        pages.append(text)
+    return "\n".join(pages).strip()
 
 
-# ----------------------------
-# RAG: Build Vector Store
-# ----------------------------
-def file_fingerprint(uploaded_files: Sequence[Any]) -> str:
-    """
-    Stable-ish id for the uploaded content.
-    Uses filename/size/mtime-like fields when available.
-    """
-    files = normalize_uploaded_files(uploaded_files)
-    entries = []
-
-    for uploaded_file in files:
-        name = getattr(uploaded_file, "name", None) or "uploaded.pdf"
-        size = getattr(uploaded_file, "size", None)
-        mtime = getattr(uploaded_file, "last_modified", None)
-        entries.append(f"{name}|{size}|{mtime}")
-
-    raw = "|".join(entries).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()[:16]
-
-
-@st.cache_resource(show_spinner=False)
-def build_vectorstore(chunks: list[Document], collection_name: str) -> Chroma:
-    return Chroma.from_documents(
-        documents=chunks,
-        embedding=OpenAIEmbeddings(model="text-embedding-3-small"),
-        collection_name=collection_name,
-    )
-
-
-# ----------------------------
-# RAG: System Prompt (Comparison-focused)
-# ----------------------------
-def build_grounded_rag_system_prompt(policy_context: str, user_context: str) -> str:
-    fallback = "I couldn't find that information in the uploaded documents."
-
-    return f"""You are a senior compliance analyst.
-
-Your task is to compare the User Document against the Policy Document, using the Policy Document as the master standard.
-
-Instructions:
-1. Use the Policy Document as the authoritative baseline.
-2. Compare the User Document against it and identify any gaps, mismatches, policy violations, or missing requirements.
-3. Structure your answer as: finding, evidence, confidence level.
-4. Include short citations like [Page 2] or [Section 2.2.3] when available in the provided context.
-5. Use only the provided context. Do not use outside facts or assumptions.
-6. If the context is insufficient, say: "{fallback}"
-
-Policy Document Context:
------------------
-{policy_context}
------------------
-
-User Document Context:
------------------
-{user_context}
------------------
-
-Now answer the user's question by comparing the User Document to the Policy Document using only the context above."""
-
-
-# ----------------------------
-# RAG: Retrieve Context
-# ----------------------------
-def retrieve_context(vectorstore: Chroma, query: str, k: int, score_threshold: float):
-    if query is None:
-        return None
-    query = str(query).strip()
-    if not query:
-        return None
-
-    try:
-        retriever = vectorstore.as_retriever(
-            search_type="similarity_score_threshold",
-            search_kwargs={"k": k, "score_threshold": score_threshold},
-        )
-        results = retriever.invoke(query)
-        if not results:
-            st.warning("No relevant context found matching the query and current retrieval settings.")
-            return None
-        return results
-    except Exception as e:
-        st.error(f"Error during document retrieval (Check parameters/API): {e}")
-        traceback.print_exc()
-        return None
-
-
-def safe_doc_to_context(doc: Document) -> str:
-    meta = getattr(doc, "metadata", None)
-    if not isinstance(meta, dict):
-        meta = {}
-
-    source = meta.get("source") or "Unknown Source"
-    try:
-        source = str(source).strip()
-    except Exception:
-        source = "Unknown Source"
-
-    content = getattr(doc, "page_content", "") or ""
-    try:
-        content = str(content).strip()
-    except Exception:
-        content = ""
-
-    return f"[Chunk | {source}] {content}".strip()
-
-
-def format_docs(label: str, docs: list[Document]) -> str:
-    if not docs:
-        return f"{label}:\nNo relevant excerpts found."
-
-    chunks = [safe_doc_to_context(doc) for doc in docs if safe_doc_to_context(doc)]
-    if not chunks:
-        return f"{label}:\nNo relevant excerpts found."
-
-    return f"{label}:\n" + "\n\n---\n\n".join(chunks)
-
-
-def build_comparison_context(policy_docs: list[Document], user_docs: list[Document], max_chars: int = 12000) -> str:
-    policy_context = format_docs("Policy Document", policy_docs)
-    user_context = format_docs("User Document", user_docs)
-
-    combined = (
-        "Policy Document Context:\n"
-        f"{policy_context}\n\n"
-        "User Document Context:\n"
-        f"{user_context}"
-    )
-
-    return combined[:max_chars]
-
-
-# ----------------------------
-# Streamlit UI: Initialise
-# ----------------------------
-st.set_page_config(page_title="AI Chatbot (RAG Grounded)", page_icon="📚🤖")
-st.title("Compliance Checker")
-
-if "messages" not in st.session_state:
-    st.session_state["messages"] = []
-
-
-# ----------------------------
-# Streamlit UI: Sidebar & Document Persistence
-# ----------------------------
 with st.sidebar:
-    st.header("📂 Knowledge Bases")
-
-    st.markdown("**Policy Document (Master / Ground Truth)**")
-    policy_files = st.file_uploader(
-        "Upload Policy PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
+    st.header("Policy and target documents")
+    policy_file = st.file_uploader("Upload policy PDF", type=["pdf"], key="policy_pdf")
+    target_file = st.file_uploader("Upload target document PDF", type=["pdf"], key="target_pdf")
 
     st.markdown("---")
-
-    st.subheader("User Document (Verify against policy)")
-    user_files = st.file_uploader(
-        "Upload User PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
-
-    # --- Policy Document Processing ---
-    if policy_files:
-        try:
-            policy_hash = file_fingerprint(policy_files)
-
-            if st.session_state.get("policy_fingerprint") != policy_hash:
-                with st.spinner("Processing Policy Documents..."):
-                    chunks = load_and_split(policy_files)
-                    coll_name = f"chroma_policy_{policy_hash}"
-
-                    st.session_state["policy_vectorstore"] = build_vectorstore(chunks, coll_name)
-                    st.session_state["policy_fingerprint"] = policy_hash
-                st.success("✅ Policy Documents Loaded.")
+    if st.button("Run verification", disabled=not (policy_file and target_file)):
+        with st.spinner("Running controlled verification..."):
+            policy_text = extract_pdf_text(policy_file)
+            target_text = extract_pdf_text(target_file)
+            if not policy_text or not target_text:
+                st.error("Unable to extract readable text from one or both PDFs.")
             else:
-                st.info("Policy documents unchanged and ready.")
-        except Exception as e:
-            st.error(f"Failed to load Policy PDFs: {e}")
-
-    # --- User Document Processing ---
-    if user_files:
-        try:
-            user_hash = file_fingerprint(user_files)
-
-            if st.session_state.get("user_fingerprint") != user_hash:
-                with st.spinner("Processing User Documents..."):
-                    chunks = load_and_split(user_files)
-                    coll_name = f"chroma_user_{user_hash}"
-
-                    st.session_state["user_vectorstore"] = build_vectorstore(chunks, coll_name)
-                    st.session_state["user_fingerprint"] = user_hash
-                st.success("✅ User Documents Loaded.")
-            else:
-                st.info("User documents unchanged and ready.")
-        except Exception as e:
-            st.error(f"Failed to load User PDFs: {e}")
-
-    # --- Retrieval Controls ---
-    st.markdown("---")
-    st.subheader("🔎 Global Retrieval Settings")
-    k_value = st.slider("Top K", min_value=1, max_value=10, value=9, step=1)
-    score_threshold = st.slider("Score Threshold", min_value=0.0, max_value=1.0, value=0.05, step=0.01)
-
-    st.session_state["k_value"] = k_value
-    st.session_state["score_threshold"] = score_threshold
-
-    st.subheader("🗑️ Conversation")
-    if st.button("Clear Conversation"):
-        st.session_state["messages"] = []
-        st.rerun()
+                st.session_state.report = setup_and_run_crew(policy_text=policy_text, document_text=target_text)
+                st.success("Verification report generated.")
 
 
-# ----------------------------
-# Streamlit UI: Render Chat
-# ----------------------------
-for entry in st.session_state["messages"]:
-    with st.chat_message(entry["role"]):
-        st.write(entry["content"])
+if st.session_state.report:
+    report = st.session_state.report
+    summary = report.get("summary", {})
+    counts = summary.get("counts", {})
 
+    st.subheader("Verification summary")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Policy version", report.get("policy_version", "n/a"))
+    col2.metric("Total findings", summary.get("total_findings", 0))
+    col3.metric("Satisfied", counts.get("satisfied", 0))
+    col4.metric("Missing", counts.get("missing", 0))
 
-# ----------------------------
-# Streamlit UI: Accept user input
-# ----------------------------
-user_input = st.chat_input("Ask how the User Document compares to the Policy Document...")
+    st.caption("Top issues")
+    st.write(", ".join(summary.get("top_issues", [])) or "No major issues identified.")
 
-# Only run inference if the user actually typed something
-if user_input:
-    user_input = user_input.strip()
+    st.subheader("Findings table")
+    findings = report.get("findings", [])
+    if findings:
+        st.dataframe(findings)
+    else:
+        st.info("No findings were generated.")
 
-    policy_vectorstore = st.session_state.get("policy_vectorstore")
-    user_vectorstore = st.session_state.get("user_vectorstore")
+    st.subheader("Revised document")
+    revised = report.get("revised_document", {})
+    st.text_area("Revised text preview", revised.get("revised_text", ""), height=220)
+    st.dataframe(revised.get("change_log", []))
 
-    if not policy_vectorstore or not user_vectorstore:
-        st.warning("Please upload both Policy PDFs and User PDFs to compare them.")
-        st.stop()
-
-    with st.spinner("Searching both knowledge bases and generating comparison..."):
-        policy_docs = retrieve_context(
-            policy_vectorstore,
-            user_input,
-            k=st.session_state["k_value"],
-            score_threshold=st.session_state["score_threshold"],
-        ) or []
-
-        user_docs = retrieve_context(
-            user_vectorstore,
-            user_input,
-            k=st.session_state["k_value"],
-            score_threshold=st.session_state["score_threshold"],
-        ) or []
-
-        context_str = build_comparison_context(policy_docs, user_docs)
-        contextual_system_message = build_grounded_rag_system_prompt(
-            policy_context=context_str.split("User Document Context:", 1)[0].replace("Policy Document Context:\n", "").strip(),
-            user_context=context_str.split("User Document Context:", 1)[1].strip(),
-        )
-
-        with st.spinner("Thinking..."):
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": contextual_system_message},
-                    {"role": "user", "content": user_input},
-                ],
-                temperature=0.1,
-            )
-            assistant_reply = response.choices[0].message.content
-
-        with st.chat_message("assistant"):
-            st.write(assistant_reply)
-
-        st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
-
-
+    with st.expander("Raw JSON report"):
+        st.json(report)
+else:
+    st.info("Upload a policy PDF and a target document PDF, then run the verification workflow.")
