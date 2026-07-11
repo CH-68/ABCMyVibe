@@ -1,61 +1,99 @@
 import os
-import traceback
 import tempfile
-import hashlib
+import traceback
+from typing import Any, Sequence
 
 import streamlit as st
-from openai import OpenAI
-
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from openai import OpenAI
+import hashlib
 
 # ----------------------------
 # LLM setup
 # ----------------------------
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
+
+def normalize_uploaded_files(uploaded_files: Any) -> list[Any]:
+    """Accept either a single uploaded file or a list of uploaded files."""
+    if uploaded_files is None:
+        return []
+    if isinstance(uploaded_files, (list, tuple)):
+        return list(uploaded_files)
+    return [uploaded_files]
+
+
 # ----------------------------
 # RAG: Load + Split PDF
 # ----------------------------
-def load_and_split(uploaded_file) -> list[Document]:
-    """Load a PDF from an uploaded file object, split into chunks, return LangChain Document chunks."""
-    data = uploaded_file.read()
-    if not data:
-        raise ValueError("Uploaded file is empty or unreadable.")
+def load_and_split(uploaded_files: Sequence[Any]) -> list[Document]:
+    """Load one or more uploaded PDFs, split them into chunks, and return LangChain Document chunks."""
+    files = normalize_uploaded_files(uploaded_files)
+    if not files:
+        raise ValueError("No files were uploaded.")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(data)
-        temp_file_path = tmp.name
+    all_chunks: list[Document] = []
 
-    try:
-        loader = PyPDFLoader(temp_file_path)
-        pages = loader.load()
+    for uploaded_file in files:
+        data = uploaded_file.read()
+        if not data:
+            continue
 
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100,
-            separators=["\n\n", "\n", " ", ""],
-        )
-        return text_splitter.split_documents(pages)
-    finally:
-        os.remove(temp_file_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(data)
+            temp_file_path = tmp.name
+
+        try:
+            loader = PyPDFLoader(temp_file_path)
+            pages = loader.load()
+
+            if not pages:
+                continue
+
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=800,
+                chunk_overlap=100,
+                separators=["\n\n", "\n", " ", ""],
+            )
+            chunks = text_splitter.split_documents(pages)
+
+            for chunk in chunks:
+                metadata = dict(getattr(chunk, "metadata", {}) or {})
+                metadata["source"] = getattr(uploaded_file, "name", "uploaded.pdf")
+                chunk.metadata = metadata
+
+            all_chunks.extend(chunks)
+        finally:
+            os.remove(temp_file_path)
+
+    if not all_chunks:
+        raise ValueError("No readable text could be extracted from the uploaded PDFs.")
+
+    return all_chunks
 
 
 # ----------------------------
 # RAG: Build Vector Store
 # ----------------------------
-def file_fingerprint(uploaded_file) -> str:
+def file_fingerprint(uploaded_files: Sequence[Any]) -> str:
     """
     Stable-ish id for the uploaded content.
-    Note: this does NOT hash file bytes; it uses filename/size/mtime-like fields if available.
+    Uses filename/size/mtime-like fields when available.
     """
-    name = uploaded_file.name or "uploaded.pdf"
-    size = getattr(uploaded_file, "size", None)
-    mtime = getattr(uploaded_file, "last_modified", None)
-    raw = f"{name}|{size}|{mtime}".encode("utf-8")
+    files = normalize_uploaded_files(uploaded_files)
+    entries = []
+
+    for uploaded_file in files:
+        name = getattr(uploaded_file, "name", None) or "uploaded.pdf"
+        size = getattr(uploaded_file, "size", None)
+        mtime = getattr(uploaded_file, "last_modified", None)
+        entries.append(f"{name}|{size}|{mtime}")
+
+    raw = "|".join(entries).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
@@ -69,31 +107,34 @@ def build_vectorstore(chunks: list[Document], collection_name: str) -> Chroma:
 
 
 # ----------------------------
-# RAG: System Prompt (Ground-only)
+# RAG: System Prompt (Comparison-focused)
 # ----------------------------
-def build_grounded_rag_system_prompt(context: str) -> str:
-    fallback = "I couldn't find that information in the uploaded document."
+def build_grounded_rag_system_prompt(policy_context: str, user_context: str) -> str:
+    fallback = "I couldn't find that information in the uploaded documents."
 
-    # With "pseudo citations", we ask for bracket citations but do not guarantee they map to
-    # actual page/section IDs unless your metadata includes that. (This matches your request.)
-    return f"""You are a highly accurate and comprehensive document QA engine.
+    return f"""You are a senior compliance analyst.
 
-Your goal is to help the user synthesize, summarize, and extract insights from the provided Context.
+Your task is to compare the User Document against the Policy Document, using the Policy Document as the master standard.
 
-Rules:
-1. Grounded Synthesis: You may integrate insights across different parts of the Context.
-2. No Outside Facts: Use ONLY the provided Context. Do not bring in external information, assumptions, or real-world data not mentioned in the text.
-3. Reasoning vs. Guessing: Use only reasoning that is explicitly supported by the Context. Do not speculate beyond what is written.
-4. Fallback: If the Context completely lacks information to address the query or form a summary, state clearly: "{fallback}"
-5. True citations: Include a short bracket citation like [Page 2] and [Section 2.2.3] (or any bracketed label or header mentioned in the context) in each response.
-6. When asked to summarize, list insights with citations, based on the topic asked
+Instructions:
+1. Use the Policy Document as the authoritative baseline.
+2. Compare the User Document against it and identify any gaps, mismatches, policy violations, or missing requirements.
+3. Structure your answer as: finding, evidence, confidence level.
+4. Include short citations like [Page 2] or [Section 2.2.3] when available in the provided context.
+5. Use only the provided context. Do not use outside facts or assumptions.
+6. If the context is insufficient, say: "{fallback}"
 
-Context:
+Policy Document Context:
 -----------------
-{context}
+{policy_context}
 -----------------
 
-Now answer the user's question using ONLY the Context provided above."""
+User Document Context:
+-----------------
+{user_context}
+-----------------
+
+Now answer the user's question by comparing the User Document to the Policy Document using only the context above."""
 
 
 # ----------------------------
@@ -139,64 +180,116 @@ def safe_doc_to_context(doc: Document) -> str:
     except Exception:
         content = ""
 
-    # Pseudo-citation-friendly prefix
     return f"[Chunk | {source}] {content}".strip()
+
+
+def format_docs(label: str, docs: list[Document]) -> str:
+    if not docs:
+        return f"{label}:\nNo relevant excerpts found."
+
+    chunks = [safe_doc_to_context(doc) for doc in docs if safe_doc_to_context(doc)]
+    if not chunks:
+        return f"{label}:\nNo relevant excerpts found."
+
+    return f"{label}:\n" + "\n\n---\n\n".join(chunks)
+
+
+def build_comparison_context(policy_docs: list[Document], user_docs: list[Document], max_chars: int = 12000) -> str:
+    policy_context = format_docs("Policy Document", policy_docs)
+    user_context = format_docs("User Document", user_docs)
+
+    combined = (
+        "Policy Document Context:\n"
+        f"{policy_context}\n\n"
+        "User Document Context:\n"
+        f"{user_context}"
+    )
+
+    return combined[:max_chars]
 
 
 # ----------------------------
 # Streamlit UI: Initialise
 # ----------------------------
 st.set_page_config(page_title="AI Chatbot (RAG Grounded)", page_icon="📚🤖")
-st.title("Document Q&A Engine")
+st.title("Compliance Checker")
 
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
+
 
 # ----------------------------
 # Streamlit UI: Sidebar & Document Persistence
 # ----------------------------
 with st.sidebar:
-    st.subheader("📄 Document")
+    st.header("📂 Knowledge Bases")
 
-    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"], accept_multiple_files=False)
+    st.markdown("**Policy Document (Master / Ground Truth)**")
+    policy_files = st.file_uploader(
+        "Upload Policy PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
 
-    if uploaded_file:
-        current_fingerprint = file_fingerprint(uploaded_file)
+    st.markdown("---")
 
-        if st.session_state.get("current_file_hash") != current_fingerprint:
-            with st.spinner("Processing new document..."):
-                try:
-                    chunks = load_and_split(uploaded_file)
-                    coll_name = f"chroma_docs_{current_fingerprint}"
+    st.subheader("User Document (Verify against policy)")
+    user_files = st.file_uploader(
+        "Upload User PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
 
-                    st.session_state["vectorstore"] = build_vectorstore(chunks, coll_name)
-                    st.session_state["current_file_hash"] = current_fingerprint
-                    st.session_state["uploaded_file_name"] = uploaded_file.name
+    # --- Policy Document Processing ---
+    if policy_files:
+        try:
+            policy_hash = file_fingerprint(policy_files)
 
-                    # Clear past chat history since a brand new document was uploaded
-                    st.session_state["messages"] = []
-                except Exception as e:
-                    st.error(f"Failed to load and process PDF: {e}")
-                    traceback.print_exc()
-                    st.session_state.pop("vectorstore", None)
-                    st.session_state.pop("current_file_hash", None)
+            if st.session_state.get("policy_fingerprint") != policy_hash:
+                with st.spinner("Processing Policy Documents..."):
+                    chunks = load_and_split(policy_files)
+                    coll_name = f"chroma_policy_{policy_hash}"
 
-        st.success(f"Active Document: {st.session_state.get('uploaded_file_name')}")
-    else:
-        st.session_state.pop("vectorstore", None)
-        st.session_state.pop("current_file_hash", None)
-        st.session_state.pop("uploaded_file_name", None)
-        if "vectorstore" not in st.session_state:
-            st.info("Upload a PDF to enable document Q&A.")
+                    st.session_state["policy_vectorstore"] = build_vectorstore(chunks, coll_name)
+                    st.session_state["policy_fingerprint"] = policy_hash
+                st.success("✅ Policy Documents Loaded.")
+            else:
+                st.info("Policy documents unchanged and ready.")
+        except Exception as e:
+            st.error(f"Failed to load Policy PDFs: {e}")
 
-    st.subheader("🔎 Retrieval")
-    st.session_state["k_value"] = st.slider("Top K", min_value=1, max_value=10, value=9, step=1)
-    st.session_state["score_threshold"] = st.slider("Score Threshold", min_value=0.0, max_value=1.0, value=0.05, step=0.01)
+    # --- User Document Processing ---
+    if user_files:
+        try:
+            user_hash = file_fingerprint(user_files)
+
+            if st.session_state.get("user_fingerprint") != user_hash:
+                with st.spinner("Processing User Documents..."):
+                    chunks = load_and_split(user_files)
+                    coll_name = f"chroma_user_{user_hash}"
+
+                    st.session_state["user_vectorstore"] = build_vectorstore(chunks, coll_name)
+                    st.session_state["user_fingerprint"] = user_hash
+                st.success("✅ User Documents Loaded.")
+            else:
+                st.info("User documents unchanged and ready.")
+        except Exception as e:
+            st.error(f"Failed to load User PDFs: {e}")
+
+    # --- Retrieval Controls ---
+    st.markdown("---")
+    st.subheader("🔎 Global Retrieval Settings")
+    k_value = st.slider("Top K", min_value=1, max_value=10, value=9, step=1)
+    score_threshold = st.slider("Score Threshold", min_value=0.0, max_value=1.0, value=0.05, step=0.01)
+
+    st.session_state["k_value"] = k_value
+    st.session_state["score_threshold"] = score_threshold
 
     st.subheader("🗑️ Conversation")
     if st.button("Clear Conversation"):
         st.session_state["messages"] = []
         st.rerun()
+
 
 # ----------------------------
 # Streamlit UI: Render Chat
@@ -205,44 +298,44 @@ for entry in st.session_state["messages"]:
     with st.chat_message(entry["role"]):
         st.write(entry["content"])
 
+
 # ----------------------------
 # Streamlit UI: Accept user input
 # ----------------------------
-user_input = st.chat_input("Ask a question about the uploaded document...")
+user_input = st.chat_input("Ask how the User Document compares to the Policy Document...")
 
 # Only run inference if the user actually typed something
 if user_input:
     user_input = user_input.strip()
 
-    if "vectorstore" not in st.session_state or st.session_state["vectorstore"] is None:
-        st.warning("Please upload a PDF document first to enable Q&A functionality.")
+    policy_vectorstore = st.session_state.get("policy_vectorstore")
+    user_vectorstore = st.session_state.get("user_vectorstore")
+
+    if not policy_vectorstore or not user_vectorstore:
+        st.warning("Please upload both Policy PDFs and User PDFs to compare them.")
         st.stop()
 
-    # Render user message (and persist it)
-    with st.chat_message("user"):
-        st.write(user_input)
-    st.session_state["messages"].append({"role": "user", "content": user_input})
-
-    with st.spinner("Searching knowledge base and generating response..."):
-        relevant_docs = retrieve_context(
-            st.session_state["vectorstore"],
+    with st.spinner("Searching both knowledge bases and generating comparison..."):
+        policy_docs = retrieve_context(
+            policy_vectorstore,
             user_input,
             k=st.session_state["k_value"],
             score_threshold=st.session_state["score_threshold"],
+        ) or []
+
+        user_docs = retrieve_context(
+            user_vectorstore,
+            user_input,
+            k=st.session_state["k_value"],
+            score_threshold=st.session_state["score_threshold"],
+        ) or []
+
+        context_str = build_comparison_context(policy_docs, user_docs)
+        contextual_system_message = build_grounded_rag_system_prompt(
+            policy_context=context_str.split("User Document Context:", 1)[0].replace("Policy Document Context:\n", "").strip(),
+            user_context=context_str.split("User Document Context:", 1)[1].strip(),
         )
 
-        # Build context string (cap size)
-        max_chars = 12000
-        if relevant_docs:
-            context_chunks = [safe_doc_to_context(doc) for doc in relevant_docs if safe_doc_to_context(doc)]
-            context_str = "\n\n---\n\n".join(context_chunks)
-            context_str = context_str[:max_chars]
-        else:
-            context_str = ""
-
-        contextual_system_message = build_grounded_rag_system_prompt(context_str)
-
-        # Call the LLM
         with st.spinner("Thinking..."):
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -254,7 +347,9 @@ if user_input:
             )
             assistant_reply = response.choices[0].message.content
 
-        # Render + persist assistant message
         with st.chat_message("assistant"):
             st.write(assistant_reply)
+
         st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
+
+
