@@ -1,7 +1,7 @@
 ﻿import io
 import streamlit as st
 from pypdf import PdfReader
-
+from helper_functions.utility import check_password
 from src.crew import setup_and_run_crew
 
 st.set_page_config(page_title="Compliance Verifier", page_icon="🛡️")
