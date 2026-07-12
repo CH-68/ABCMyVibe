@@ -370,11 +370,10 @@ if verification_report:
         df_columns = {
             "requirement_id": "Requirement",
             "verification": "Verification",
-            "severity": "Severity",
             "issue_type": "Issue Type",
             "policy_citation": "Policy Citation",
             "user_citation": "User Citation",
-            "deviation_highlight": "Deviation Analysis",
+            "review_highlight": "Deviation Analysis",
             "suggested_edits": "Suggested Edits",
         }
         df = df.rename(columns=df_columns)
