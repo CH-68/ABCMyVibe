@@ -169,7 +169,7 @@ def _verify_item(policy_text: str, document_text: str, item_text: str) -> Dict[s
     return result
 
 
-def generate_llm_narrative(policy_text: str, document_text: str) -> str:
+def _build_llm_messages(policy_text: str, document_text: str) -> List[Dict[str, str]]:
     system_prompt = (
         'You are a senior compliance analyst.\n\n'
         'Your task is to compare the User Document against the Policy Document, using the Policy Document as the master standard.\n\n'
@@ -180,18 +180,17 @@ def generate_llm_narrative(policy_text: str, document_text: str) -> str:
         '4. Include short citations like [Page 2] or [Section 2.2.3] when available in the provided context.\n\n'
         '5. Use only the provided context. Do not use outside facts or assumptions.\n\n'
         '6. If the context is insufficient, say: "{fallback}"\n\n'
-        'Policy Document Context:\n\n'
-        '{policy_context}\n\n'
-        'User Document Context:\n\n'
-        '{user_context}\n\n'
-        'Now answer the user by comparing the User Document to the Policy Document using only the context above.'
+        'Now answer the user by comparing the User Document to the Policy Document using only the context provided in the user message.'
     )
 
-    # assemble messages per chat completion API shape
-    messages = [
+    return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps({"policy_context": policy_text, "user_context": document_text})},
     ]
+
+
+def generate_llm_narrative(policy_text: str, document_text: str) -> str:
+    messages = _build_llm_messages(policy_text, document_text)
 
     try:
         llm_response = llm_client.get_completion(messages=messages, model="gpt-4o-mini", temperature=0)
@@ -202,9 +201,12 @@ def generate_llm_narrative(policy_text: str, document_text: str) -> str:
     return llm_response
 
 
-def setup_and_run_crew(policy_text: str, document_text: str) -> Dict[str, Any]:
+def setup_and_run_crew(policy_text: str, document_text: str, llm_text: str | None = None) -> Dict[str, Any]:
     """New workflow: ask LLM for a concise narrative, then verify each item deterministically."""
-    llm_text = generate_llm_narrative(policy_text, document_text)
+    if llm_text is None:
+        llm_text = generate_llm_narrative(policy_text, document_text)
+
+    messages = _build_llm_messages(policy_text, document_text)
     items = _parse_llm_items(llm_text)
 
     verifier_results = []
@@ -237,6 +239,7 @@ def setup_and_run_crew(policy_text: str, document_text: str) -> Dict[str, Any]:
     report = {
         "policy_version": DEFAULT_POLICY_VERSION,
         "llm_narrative": llm_text,
+        "llm_system_prompt": messages[0]["content"],
         "summary": {
             "total_findings": len(verifier_results),
             "counts": counts,
@@ -250,38 +253,3 @@ def setup_and_run_crew(policy_text: str, document_text: str) -> Dict[str, Any]:
     }
 
     return report
-
-
-def setup_and_run_crew(policy_text: str, document_text: str) -> Dict[str, Any]:
-    """Assemble a simple CrewAI workflow around the deterministic verifier."""
-    verifier_agent = Agent(
-        role="Compliance Verifier",
-        goal="Evaluate a document against policy requirements and produce an auditable verification report.",
-        backstory=(
-            "A careful verifier that uses deterministic checks, preserves auditability, abstains on uncertainty, "
-            "and routes unclear cases to human review."
-        ),
-        verbose=False,
-        allow_delegation=False,
-    )
-
-    verifier_task = Task(
-        description=(
-            "Review the provided policy and document text. Produce a JSON report that lists findings, verdicts, evidence, "
-            "and suggested edits while abstaining from unsupported conclusions."
-        ),
-        expected_output="A JSON object matching the requested compliance report schema.",
-        agent=verifier_agent,
-    )
-
-    crew = Crew(
-        agents=[verifier_agent],
-        tasks=[verifier_task],
-        process=Process.sequential,
-        verbose=False,
-    )
-
-    report_json = json.dumps(build_verification_report(policy_text=policy_text, document_text=document_text))
-    verifier_task.description = f"{verifier_task.description}\nReference data:\n{report_json}"
-    _ = crew.kickoff()
-    return json.loads(report_json)

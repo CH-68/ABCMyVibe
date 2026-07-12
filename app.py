@@ -2,7 +2,8 @@
 import streamlit as st
 from pypdf import PdfReader
 from helper_functions.utility import check_password
-from src.crew import setup_and_run_crew
+from helper_functions import llm as llm_client
+from src.crew import setup_and_run_crew, build_llm_messages
 import pandas as pd
 import base64
 
@@ -19,6 +20,7 @@ if "report" not in st.session_state:
 if not check_password():
         st.stop()
 
+llm_stream_placeholder = st.empty()
 
 def extract_pdf_text(uploaded_file) -> str:
     if uploaded_file is None:
@@ -45,7 +47,21 @@ with st.sidebar:
             if not policy_text or not target_text:
                 st.error("Unable to extract readable text from one or both PDFs.")
             else:
-                st.session_state.report = setup_and_run_crew(policy_text=policy_text, document_text=target_text)
+                messages = build_llm_messages(policy_text, target_text)
+                try:
+                    llm_text = llm_stream_placeholder.write_stream(
+                        llm_client.get_completion_stream(messages=messages, model="gpt-4o-mini", temperature=0),
+                        cursor="|",
+                    )
+                except Exception as e:
+                    st.error(f"LLM streaming failed: {e}")
+                    llm_text = ""
+
+                st.session_state.report = setup_and_run_crew(
+                    policy_text=policy_text,
+                    document_text=target_text,
+                    llm_text=llm_text,
+                )
                 st.success("Verification report generated.")
 
 
@@ -85,6 +101,13 @@ if st.session_state.report:
     st.subheader("Findings table")
     findings = report.get("findings", [])
     if findings:
+        st.subheader("Issues sent to agent verifier")
+        for f in findings:
+            fid = f.get("id")
+            item = f.get("llm_item")
+            citation = f.get("verifier", {}).get("citation", "") or "No citation"
+            st.markdown(f"**{fid}** — {item}  \n\n**Citation:** {citation}")
+
         # show LLM narrative
         st.subheader("LLM Narrative")
         st.text_area("LLM output", llm_narrative, height=200)
@@ -108,13 +131,5 @@ if st.session_state.report:
             st.markdown(f"[Download findings CSV]({href})")
     else:
         st.info("No findings were generated.")
-
-    st.subheader("Revised document")
-    revised = report.get("revised_document", {})
-    st.text_area("Revised text preview", revised.get("revised_text", ""), height=220)
-    st.dataframe(revised.get("change_log", []))
-
-    with st.expander("Raw JSON report"):
-        st.json(report)
 else:
     st.info("Upload a policy PDF and a target document PDF, then run the verification workflow.")
