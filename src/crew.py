@@ -169,7 +169,10 @@ def _verify_item(policy_text: str, document_text: str, item_text: str) -> Dict[s
     return result
 
 
-def _build_llm_messages(policy_text: str, document_text: str) -> List[Dict[str, str]]:
+
+def build_llm_messages(policy_text: str, document_text: str) -> List[Dict[str, str]]:
+    fallback = "I couldn't find that information in the uploaded documents."
+
     system_prompt = (
         'You are a senior compliance analyst.\n\n'
         'Your task is to compare the User Document against the Policy Document, using the Policy Document as the master standard.\n\n'
@@ -190,7 +193,7 @@ def _build_llm_messages(policy_text: str, document_text: str) -> List[Dict[str, 
 
 
 def generate_llm_narrative(policy_text: str, document_text: str) -> str:
-    messages = _build_llm_messages(policy_text, document_text)
+    messages = (policy_text, document_text)
 
     try:
         llm_response = llm_client.get_completion(messages=messages, model="gpt-4o-mini", temperature=0)
@@ -206,7 +209,7 @@ def setup_and_run_crew(policy_text: str, document_text: str, llm_text: str | Non
     if llm_text is None:
         llm_text = generate_llm_narrative(policy_text, document_text)
 
-    messages = _build_llm_messages(policy_text, document_text)
+    messages = (policy_text, document_text)
     items = _parse_llm_items(llm_text)
 
     verifier_results = []
