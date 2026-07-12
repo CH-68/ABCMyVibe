@@ -1,5 +1,5 @@
 import os
-from dotenv load_dotenv
+from dotenv import load_dotenv
 import tempfile
 import traceback
 from typing import Any, Sequence
