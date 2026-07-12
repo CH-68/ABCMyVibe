@@ -2,10 +2,8 @@
 import streamlit as st
 from pypdf import PdfReader
 from helper_functions.utility import check_password
-from helper_functions import llm as llm_client
-from src.crew import setup_and_run_crew, build_llm_messages
-import pandas as pd
-import base64
+from src.crew import setup_and_run_crew
+from docx import Document
 
 st.set_page_config(page_title="Compliance Verifier", page_icon="🛡️")
 st.title("Agentic Compliance Verifier")
@@ -19,8 +17,6 @@ if "report" not in st.session_state:
 # Do not continue if check_password is not True.
 if not check_password():
         st.stop()
-
-llm_stream_placeholder = st.empty()
 
 def extract_pdf_text(uploaded_file) -> str:
     if uploaded_file is None:
@@ -47,20 +43,9 @@ with st.sidebar:
             if not policy_text or not target_text:
                 st.error("Unable to extract readable text from one or both PDFs.")
             else:
-                messages = build_llm_messages(policy_text, target_text)
-                try:
-                    llm_text = llm_stream_placeholder.write_stream(
-                        llm_client.get_completion_stream(messages=messages, model="gpt-4o-mini", temperature=0),
-                        cursor="|",
-                    )
-                except Exception as e:
-                    st.error(f"LLM streaming failed: {e}")
-                    llm_text = ""
-
                 st.session_state.report = setup_and_run_crew(
                     policy_text=policy_text,
                     document_text=target_text,
-                    llm_text=llm_text,
                 )
                 st.success("Verification report generated.")
 
@@ -69,66 +54,80 @@ if st.session_state.report:
     report = st.session_state.report
     summary = report.get("summary", {})
     counts = summary.get("counts", {})
-    llm_narrative = report.get("llm_narrative", "")
 
-    # Dashboard counts and color indicators
-    st.subheader("Agent Verifier Dashboard")
+    st.subheader("Verification summary")
     pass_count = counts.get("pass", 0)
     fail_count = counts.get("fail", 0)
     insuff_count = counts.get("insufficient evidence", 0)
-    col_pass, col_fail, col_insuff = st.columns(3)
-    col_pass.metric("Pass", pass_count)
-    col_fail.metric("Fail", fail_count)
-    col_insuff.metric("Insufficient", insuff_count)
+    col_pass, col_fail, col_review = st.columns(3)
+    col_pass.metric("Passed", pass_count, "✔️")
+    col_fail.metric("Failed", fail_count, "❌")
+    col_review.metric("Further review", insuff_count, "❓")
 
-    def _status_color(status: str) -> str:
-        if status == "pass":
-            return "#d4edda"
-        if status == "fail":
-            return "#f8d7da"
-        return "#fff3cd"
-
-    st.subheader("Verification summary")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Policy version", report.get("policy_version", "n/a"))
-    col2.metric("Total findings", summary.get("total_findings", 0))
-    col3.metric("Satisfied", counts.get("satisfied", 0))
-    col4.metric("Missing", counts.get("missing", 0))
-
-    st.caption("Top issues")
-    st.write(", ".join(summary.get("top_issues", [])) or "No major issues identified.")
-
-    st.subheader("Findings table")
     findings = report.get("findings", [])
     if findings:
-        st.subheader("Issues sent to agent verifier")
-        for f in findings:
-            fid = f.get("id")
-            item = f.get("llm_item")
-            citation = f.get("verifier", {}).get("citation", "") or "No citation"
-            st.markdown(f"**{fid}** — {item}  \n\n**Citation:** {citation}")
-
-        # show LLM narrative
-        st.subheader("LLM Narrative")
-        st.text_area("LLM output", llm_narrative, height=200)
-
         st.subheader("Verifier Results")
-        for f in findings:
+        for idx, f in enumerate(findings, start=1):
             fid = f.get("id")
             item = f.get("llm_item")
             verifier = f.get("verifier", {})
             status = verifier.get("status", "insufficient evidence")
-            color = _status_color(status)
-            st.markdown(f"<div style='background:{color};padding:8px;border-radius:4px'>\n**{fid}** — {status.upper()}  \n\n**LLM:** {item}  \n\n**Rationale:** {verifier.get('rationale')}  \n\n**Suggested edit:** {verifier.get('suggested_edit')}  \n\n**Citation:** {verifier.get('citation','')}\n</div>", unsafe_allow_html=True)
+            document_excerpt = f.get("document_excerpt", "No related document text found.")
+            policy_excerpt = f.get("policy_excerpt", "No related policy text found.")
+            citation = verifier.get("citation", "No citation")
 
-        # CSV download
-        csv_rows = report.get("csv_rows", [])
-        if csv_rows:
-            df = pd.DataFrame(csv_rows)
-            csv = df.to_csv(index=False)
-            b64 = base64.b64encode(csv.encode()).decode()
-            href = f"data:file/csv;base64,{b64}"
-            st.markdown(f"[Download findings CSV]({href})")
+            if status == "pass":
+                status_tag = "✔️ Pass"
+            elif status == "fail":
+                status_tag = "❌ Fail"
+            else:
+                status_tag = "❓ Further review needed"
+
+            with st.expander(f"Issue {idx}: {item} — {status_tag}", expanded=False):
+                st.markdown(f"**Original text from User Document:**\n{document_excerpt}")
+                st.markdown("**Verifier output:**")
+                st.markdown(f"- Status: **{status_tag}**")
+                st.markdown(f"- Rationale: {verifier.get('rationale')}")
+                st.markdown(f"- Suggested edit: {verifier.get('suggested_edit')}")
+                st.markdown(f"**Relevant Policy text:**\n{policy_excerpt}")
+                st.markdown(f"**Citation:** {citation}")
+
+        def build_word_report(report_data):
+            doc = Document()
+            doc.add_heading('Compliance Verifier Report', level=1)
+            doc.add_paragraph(f"Policy version: {report_data.get('policy_version', 'n/a')}")
+            doc.add_paragraph(f"Total findings: {summary.get('total_findings', 0)}")
+            doc.add_paragraph(f"Pass: {pass_count}")
+            doc.add_paragraph(f"Fail: {fail_count}")
+            doc.add_paragraph('')
+
+            for idx, f in enumerate(report_data.get('findings', []), start=1):
+                verifier = f.get('verifier', {})
+                doc.add_heading(f'Issue {idx}', level=2)
+                doc.add_paragraph(f"LLM issue: {f.get('llm_item', '')}")
+                doc.add_paragraph('Original text from User Document:')
+                doc.add_paragraph(f.get('document_excerpt', 'No related document text found.'))
+                doc.add_paragraph('Verifier output:')
+                doc.add_paragraph(f"Status: {verifier.get('status', 'insufficient evidence')}")
+                doc.add_paragraph(f"Rationale: {verifier.get('rationale', '')}")
+                doc.add_paragraph(f"Suggested edit: {verifier.get('suggested_edit', '')}")
+                doc.add_paragraph('Relevant Policy text:')
+                doc.add_paragraph(f.get('policy_excerpt', 'No related policy text found.'))
+                doc.add_paragraph(f"Citation: {verifier.get('citation', 'No citation')}")
+                doc.add_paragraph('')
+
+            buffer = io.BytesIO()
+            doc.save(buffer)
+            buffer.seek(0)
+            return buffer.getvalue()
+
+        word_bytes = build_word_report(report)
+        st.download_button(
+            label="Download formatted results as Word document",
+            data=word_bytes,
+            file_name="compliance_verification_report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
     else:
         st.info("No findings were generated.")
 else:

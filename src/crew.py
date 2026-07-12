@@ -38,6 +38,37 @@ def _highlight_deviation(policy_text: str, document_text: str, verdict: str) -> 
     return "*ambiguous*"
 
 
+def _find_relevant_excerpt(full_text: str, query: str, max_length: int = 250) -> str:
+    if not full_text:
+        return "No excerpt available."
+
+    query = query or ""
+    normalized_full = full_text.lower()
+    query_phrases = [query.strip()]
+    if len(query) < 40:
+        query_phrases = [piece.strip() for piece in re.split(r"[\n\r,.;:\-()]+", query) if piece.strip()]
+
+    query_phrases = sorted(query_phrases, key=len, reverse=True)
+    for phrase in query_phrases:
+        if len(phrase) < 8:
+            continue
+        idx = normalized_full.find(phrase.lower())
+        if idx != -1:
+            start = max(idx - 80, 0)
+            end = min(idx + len(phrase) + 80, len(full_text))
+            excerpt = full_text[start:end].strip().replace("\n", " ")
+            if start > 0:
+                excerpt = "..." + excerpt
+            if end < len(full_text):
+                excerpt = excerpt + "..."
+            return excerpt
+
+    excerpt = full_text.strip().replace("\n", " ")
+    if len(excerpt) > max_length:
+        excerpt = excerpt[:max_length].rstrip() + "..."
+    return excerpt or "No excerpt available."
+
+
 def _extract_requirements(policy_text: str) -> List[Dict[str, str]]:
     clauses = []
     for line in policy_text.splitlines():
@@ -193,13 +224,14 @@ def build_llm_messages(policy_text: str, document_text: str) -> List[Dict[str, s
 
 
 def generate_llm_narrative(policy_text: str, document_text: str) -> str:
-    messages = (policy_text, document_text)
+    # build structured chat messages for the LLM helper
+    messages = build_llm_messages(policy_text, document_text)
 
     try:
         llm_response = llm_client.get_completion(messages=messages, model="gpt-4o-mini", temperature=0)
     except Exception as e:
         st.warning(f"LLM call failed: {e}")
-        llm_response = "{fallback}"
+        llm_response = "I couldn't find that information in the uploaded documents."
 
     return llm_response
 
@@ -209,7 +241,8 @@ def setup_and_run_crew(policy_text: str, document_text: str, llm_text: str | Non
     if llm_text is None:
         llm_text = generate_llm_narrative(policy_text, document_text)
 
-    messages = (policy_text, document_text)
+    # use the same structured messages as the LLM call
+    messages = build_llm_messages(policy_text, document_text)
     items = _parse_llm_items(llm_text)
 
     verifier_results = []
@@ -221,6 +254,8 @@ def setup_and_run_crew(policy_text: str, document_text: str, llm_text: str | Non
             "id": f"LLM-{idx}",
             "llm_item": item,
             "verifier": vr,
+            "document_excerpt": _find_relevant_excerpt(document_text, item),
+            "policy_excerpt": _find_relevant_excerpt(policy_text, item),
         })
 
     # Build a simple revised document suggestion by aggregating suggested edits for fails
