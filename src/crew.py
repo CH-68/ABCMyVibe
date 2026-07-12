@@ -1,7 +1,11 @@
-﻿import json
+﻿import csv
+import json
 import re
 from typing import Any, Dict, List
 
+import streamlit as st
+
+from helper_functions import llm as llm_client
 from crewai import Agent, Crew, Process, Task
 
 
@@ -101,6 +105,150 @@ def build_verification_report(policy_text: str, document_text: str) -> Dict[str,
         },
         "findings": findings,
     }
+    return report
+
+
+def _parse_llm_items(llm_text: str) -> List[str]:
+    """Split the LLM narrative into discrete items (one per line/numbered entry)."""
+    items: List[str] = []
+    # split on numbered lines or bullets
+    for line in llm_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # remove leading numbering like '1.' or '-'
+        line = re.sub(r'^\d+\.|^-|^•', '', line).strip()
+        if line:
+            items.append(line)
+    return items
+
+
+def _verify_item(policy_text: str, document_text: str, item_text: str) -> Dict[str, str]:
+    """Deterministic verifier for a single LLM-produced item.
+
+    Returns a dict with status (pass/fail/insufficient), rationale, and suggested_edit.
+    """
+    normalized_policy = policy_text.lower()
+    normalized_doc = document_text.lower()
+    normalized_item = item_text.lower()
+
+    # Try to find explicit citations like [page 2] or [section 2.1]
+    citation_match = re.search(r"\[(page|section)\s*[^\]]+\]", item_text, re.IGNORECASE)
+    citation = citation_match.group(0) if citation_match else ""
+
+    # Heuristics: if item references policy language present in policy_text
+    found_in_policy = any(phrase.strip() in normalized_policy for phrase in re.findall(r"\b[\w\- ]{6,}\b", normalized_item))
+    found_in_doc = any(phrase.strip() in normalized_doc for phrase in re.findall(r"\b[\w\- ]{6,}\b", normalized_item))
+
+    # More robust checks: look for exact quoted snippets
+    quoted = re.findall(r'"([^"]{6,})"', item_text)
+    if quoted:
+        found_in_policy = any(q.lower() in normalized_policy for q in quoted)
+        found_in_doc = any(q.lower() in normalized_doc for q in quoted)
+
+    result = {
+        "status": "insufficient evidence",
+        "rationale": "Unable to deterministically verify the claim from provided texts.",
+        "suggested_edit": "Provide explicit policy clause or user text to support this claim.",
+        "citation": citation,
+    }
+
+    if found_in_policy and found_in_doc:
+        result["status"] = "pass"
+        result["rationale"] = "Claim matches language present in both Policy and User Document."
+        result["suggested_edit"] = "None required."
+    elif found_in_policy and not found_in_doc:
+        result["status"] = "fail"
+        result["rationale"] = "Policy requires or references this clause but the User Document does not contain matching language."
+        result["suggested_edit"] = f"Add language aligning to policy clause: {item_text}"
+    elif not found_in_policy and found_in_doc:
+        result["status"] = "insufficient evidence"
+        result["rationale"] = "User Document contains related language but no matching policy clause was found; unclear if it's required."
+        result["suggested_edit"] = "Clarify whether this is intentionally different from policy or provide policy citation."
+
+    return result
+
+
+def generate_llm_narrative(policy_text: str, document_text: str) -> str:
+    system_prompt = (
+        'You are a senior compliance analyst.\n\n'
+        'Your task is to compare the User Document against the Policy Document, using the Policy Document as the master standard.\n\n'
+        'Instructions:\n\n'
+        '1. Use the Policy Document as the authoritative baseline.\n\n'
+        '2. Compare the User Document against it and identify any gaps, mismatches, policy violations, or missing requirements.\n\n'
+        '3. Structure your answer as: finding, evidence, confidence level.\n\n'
+        '4. Include short citations like [Page 2] or [Section 2.2.3] when available in the provided context.\n\n'
+        '5. Use only the provided context. Do not use outside facts or assumptions.\n\n'
+        '6. If the context is insufficient, say: "{fallback}"\n\n'
+        'Policy Document Context:\n\n'
+        '{policy_context}\n\n'
+        'User Document Context:\n\n'
+        '{user_context}\n\n'
+        'Now answer the user by comparing the User Document to the Policy Document using only the context above.'
+    )
+
+    # assemble messages per chat completion API shape
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps({"policy_context": policy_text, "user_context": document_text})},
+    ]
+
+    try:
+        llm_response = llm_client.get_completion(messages=messages, model="gpt-4o-mini", temperature=0)
+    except Exception as e:
+        st.warning(f"LLM call failed: {e}")
+        llm_response = "{fallback}"
+
+    return llm_response
+
+
+def setup_and_run_crew(policy_text: str, document_text: str) -> Dict[str, Any]:
+    """New workflow: ask LLM for a concise narrative, then verify each item deterministically."""
+    llm_text = generate_llm_narrative(policy_text, document_text)
+    items = _parse_llm_items(llm_text)
+
+    verifier_results = []
+    counts = {"pass": 0, "fail": 0, "insufficient evidence": 0}
+    for idx, item in enumerate(items, start=1):
+        vr = _verify_item(policy_text, document_text, item)
+        counts[vr["status"]] += 1
+        verifier_results.append({
+            "id": f"LLM-{idx}",
+            "llm_item": item,
+            "verifier": vr,
+        })
+
+    # Build a simple revised document suggestion by aggregating suggested edits for fails
+    revised_suggestions = [v["verifier"]["suggested_edit"] for v in verifier_results if v["verifier"]["status"] == "fail"]
+    revised_text = "\n".join(revised_suggestions)
+
+    # Construct CSV content lines
+    csv_rows = []
+    for v in verifier_results:
+        csv_rows.append({
+            "id": v["id"],
+            "llm_item": v["llm_item"],
+            "status": v["verifier"]["status"],
+            "rationale": v["verifier"]["rationale"],
+            "suggested_edit": v["verifier"]["suggested_edit"],
+            "citation": v["verifier"].get("citation", ""),
+        })
+
+    report = {
+        "policy_version": DEFAULT_POLICY_VERSION,
+        "llm_narrative": llm_text,
+        "summary": {
+            "total_findings": len(verifier_results),
+            "counts": counts,
+        },
+        "findings": verifier_results,
+        "revised_document": {
+            "revised_text": revised_text,
+            "change_log": csv_rows,
+        },
+        "csv_rows": csv_rows,
+    }
+
     return report
 
 

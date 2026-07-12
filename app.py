@@ -3,6 +3,8 @@ import streamlit as st
 from pypdf import PdfReader
 from helper_functions.utility import check_password
 from src.crew import setup_and_run_crew
+import pandas as pd
+import base64
 
 st.set_page_config(page_title="Compliance Verifier", page_icon="🛡️")
 st.title("Agentic Compliance Verifier")
@@ -51,6 +53,24 @@ if st.session_state.report:
     report = st.session_state.report
     summary = report.get("summary", {})
     counts = summary.get("counts", {})
+    llm_narrative = report.get("llm_narrative", "")
+
+    # Dashboard counts and color indicators
+    st.subheader("Agent Verifier Dashboard")
+    pass_count = counts.get("pass", 0)
+    fail_count = counts.get("fail", 0)
+    insuff_count = counts.get("insufficient evidence", 0)
+    col_pass, col_fail, col_insuff = st.columns(3)
+    col_pass.metric("Pass", pass_count)
+    col_fail.metric("Fail", fail_count)
+    col_insuff.metric("Insufficient", insuff_count)
+
+    def _status_color(status: str) -> str:
+        if status == "pass":
+            return "#d4edda"
+        if status == "fail":
+            return "#f8d7da"
+        return "#fff3cd"
 
     st.subheader("Verification summary")
     col1, col2, col3, col4 = st.columns(4)
@@ -65,7 +85,27 @@ if st.session_state.report:
     st.subheader("Findings table")
     findings = report.get("findings", [])
     if findings:
-        st.dataframe(findings)
+        # show LLM narrative
+        st.subheader("LLM Narrative")
+        st.text_area("LLM output", llm_narrative, height=200)
+
+        st.subheader("Verifier Results")
+        for f in findings:
+            fid = f.get("id")
+            item = f.get("llm_item")
+            verifier = f.get("verifier", {})
+            status = verifier.get("status", "insufficient evidence")
+            color = _status_color(status)
+            st.markdown(f"<div style='background:{color};padding:8px;border-radius:4px'>\n**{fid}** — {status.upper()}  \n\n**LLM:** {item}  \n\n**Rationale:** {verifier.get('rationale')}  \n\n**Suggested edit:** {verifier.get('suggested_edit')}  \n\n**Citation:** {verifier.get('citation','')}\n</div>", unsafe_allow_html=True)
+
+        # CSV download
+        csv_rows = report.get("csv_rows", [])
+        if csv_rows:
+            df = pd.DataFrame(csv_rows)
+            csv = df.to_csv(index=False)
+            b64 = base64.b64encode(csv.encode()).decode()
+            href = f"data:file/csv;base64,{b64}"
+            st.markdown(f"[Download findings CSV]({href})")
     else:
         st.info("No findings were generated.")
 
