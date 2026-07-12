@@ -7,7 +7,7 @@ from src.crew import setup_and_run_crew
 st.set_page_config(page_title="Compliance Verifier", page_icon="🛡️")
 st.title("Agentic Compliance Verifier")
 st.caption(
-    "CrewAI-based verification for repeatable, auditable policy checks for human-in-the-loop."
+    "CrewAI-based verification for repeatable, auditable policy checks to aid human-in-the-loop."
 )
 
 if "report" not in st.session_state:
